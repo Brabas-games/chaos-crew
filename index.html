@@ -189,7 +189,7 @@ const rand=(a,b)=>a+Math.random()*(b-a);
 const clamp=(v,a,b)=>v<a?a:v>b?b:v;
 function angLerp(a,b,t){let d=((b-a+Math.PI*3)%(Math.PI*2))-Math.PI;return a+d*t;}
 function show(id){['menu','lobby','shop','results'].forEach(s=>$(s).classList.toggle('hidden',s!==id));}
-let toastT;function toast(m){const t=$('toast');t.textContent=m;t.style.opacity=1;clearTimeout(toastT);toastT=setTimeout(()=>t.style.opacity=0,2600);}
+let toastT;function toast(m,ms){const t=$('toast');t.textContent=m;t.style.opacity=1;clearTimeout(toastT);toastT=setTimeout(()=>t.style.opacity=0,ms||2600);}
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
 /* ================= AUDIO ================= */
@@ -255,7 +255,35 @@ class LocalPeer{ // solo per test: #local usa BroadcastChannel tra schede
  destroy(){Object.values(this.conns).forEach(c=>c.close());this.bc.close();}
 }
 class LocalConn{constructor(p,peer,cid){this.p=p;this.peer=peer;this.cid=cid;this.h={};this.open=false;}on(e,f){this.h[e]=f;}_e(e,...a){if(e==='open')this.open=true;this.h[e]&&this.h[e](...a);}send(d){this.p.bc.postMessage({to:this.peer,from:this.p.id,cid:this.cid,ty:'data',d});}close(){try{this.p.bc.postMessage({to:this.peer,from:this.p.id,cid:this.cid,ty:'close'});}catch(e){}}}
-function makePeer(id){if(LOCAL)return new LocalPeer(id);if(typeof Peer==='undefined')return null;return id?new Peer(id):new Peer();}
+/* ---- Server "ponte" (TURN) ----
+   Serve quando due giocatori sono su reti diverse (es. dati mobili): PeerJS non offre più il suo TURN gratuito.
+   Crea un account gratuito su https://dashboard.metered.ca/signup (Open Relay, 20 GB/mese gratis),
+   poi scrivi qui sotto il nome della tua app (xxx in xxx.metered.live) e la API key. */
+const TURN={app:'',key:''};
+const STUN=[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'},{urls:'stun:stun.cloudflare.com:3478'}];
+const hasTurn=()=>!!(TURN.app&&TURN.key);
+let iceCache=null;
+async function iceServers(){
+ if(iceCache)return iceCache;
+ let list=STUN.slice();
+ if(hasTurn()){try{const ctl=new AbortController(),t=setTimeout(()=>ctl.abort(),5000);
+  const r=await fetch('https://'+TURN.app+'.metered.live/api/v1/turn/credentials?apiKey='+encodeURIComponent(TURN.key),{signal:ctl.signal});clearTimeout(t);
+  if(r.ok){const j=await r.json();if(Array.isArray(j)&&j.length)list=list.concat(j);}}catch(e){}}
+ return iceCache=list;
+}
+async function makePeer(id){
+ if(LOCAL)return new LocalPeer(id);if(typeof Peer==='undefined')return null;
+ const opts={config:{iceServers:await iceServers()},debug:1};
+ return id?new Peer(id,opts):new Peer(opts);
+}
+// se il telefono va in background (es. per mandare l'invito su WhatsApp) il collegamento al server si chiude: lo riapriamo
+function keepAlive(p){
+ p.on('disconnected',()=>{setTimeout(()=>{if(net.peer===p&&!p.destroyed&&p.disconnected){try{p.reconnect();}catch(e){}}},700);});
+}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState!=='visible')return;const p=net.peer;
+ if(p&&!p.destroyed&&p.disconnected){try{p.reconnect();}catch(e){}}requestWake();});
+let wake=null;
+async function requestWake(){try{if(net.role==='host'&&'wakeLock' in navigator&&!wake){wake=await navigator.wakeLock.request('screen');wake.addEventListener('release',()=>{wake=null;});}}catch(e){}}
 
 const net={role:'none',peer:null,conns:new Map(),conn:null,code:''};
 let roster={};   // id -> {name,color,hat,perks}
@@ -275,14 +303,22 @@ function leaveNet(){
 }
 function bcast(m){net.conns.forEach(c=>{if(c.open)try{c.send(m);}catch(e){}});}
 
-function createRoom(tries){
- tries=tries||0;
- const code=genCode();const p=makePeer(PFX+code);
- if(!p){toast('Rete non disponibile: prova l\'allenamento da solo');return;}
- toast('Creo la stanza…');
+let busy=false;
+async function createRoom(tries){
+ tries=tries||0;if(busy&&!tries)return;busy=true;
+ toast('Creo la stanza…',20000);
+ const code=genCode();const p=await makePeer(PFX+code);
+ if(!p){busy=false;toast('Rete non disponibile: prova l\'allenamento da solo');return;}
  net.peer=p;net.role='host';net.code=code;myId='H';roster={H:myInfo()};
- p.on('open',()=>{phase='lobby';renderLobby();show('lobby');history.replaceState(null,'',location.pathname+'?room='+code+(LOCAL?'#local':''));});
- p.on('error',e=>{if(e&&e.type==='unavailable-id'&&tries<4){leaveNet();createRoom(tries+1);}else{toast('Errore di rete: '+(e&&e.type||e));}});
+ let opened=false;
+ keepAlive(p);
+ p.on('open',()=>{if(opened){toast('Di nuovo online ✔');return;}opened=true;busy=false;toast('Stanza pronta! Invita gli amici');requestWake();
+  phase='lobby';renderLobby();show('lobby');history.replaceState(null,'',location.pathname+'?room='+code+(LOCAL?'#local':''));});
+ p.on('error',e=>{const t=e&&e.type;
+  if(t==='unavailable-id'&&tries<4&&!opened){leaveNet();createRoom(tries+1);return;}
+  if(!opened){busy=false;leaveNet();toast('Non riesco a raggiungere il server delle stanze. Controlla la connessione e riprova.',6000);return;}
+  if(t==='network'||t==='server-error'||t==='socket-error'||t==='socket-closed'||t==='disconnected'){toast('Connessione al server persa, riprovo…',4000);return;}
+  if(t!=='peer-unavailable')toast('Errore di rete: '+t);});
  p.on('connection',conn=>{
   conn.on('data',d=>hostMsg(conn,d));
   conn.on('close',()=>dropPlayer(conn.peer));
@@ -311,23 +347,34 @@ function dropPlayer(id){
 }
 function syncLobby(){bcast({t:'lobby',roster,code:net.code,ph:phase});if(phase==='lobby')renderLobby();}
 
-function joinRoom(code){
+async function joinRoom(code){
  code=code.toUpperCase().replace(/[^A-Z]/g,'');
  if(code.length!==4){toast('Il codice ha 4 lettere');return;}
- const p=makePeer();
- if(!p){toast('Rete non disponibile');return;}
- toast('Mi collego alla stanza '+code+'…');
+ if(busy)return;busy=true;
+ toast('Mi collego al server…',30000);
+ const p=await makePeer();
+ if(!p){busy=false;toast('Rete non disponibile');return;}
  net.peer=p;net.role='client';net.code=code;
- let ok=false;
- const to=setTimeout(()=>{if(!ok){toast('Stanza non trovata');leaveNet();}},12000);
- p.on('open',id=>{
-  myId=id;
+ const t0=Date.now();let ok=false,done=false,lastMissing=0;
+ const blocked=hasTurn()?'Connessione bloccata dalla rete. Riprova tra poco o usate la stessa Wi-Fi.'
+  :'La stanza c\'è, ma le vostre reti non riescono a collegarsi (succede spesso con i dati mobili). Per ora collegatevi tutti alla stessa Wi-Fi.';
+ const fail=m=>{if(done)return;done=true;busy=false;clearTimeout(to);leaveNet();toast(m,9000);};
+ const to=setTimeout(()=>fail(Date.now()-lastMissing<6000?'Stanza '+code+' non trovata. Controlla il codice e che il capocantiere tenga il gioco aperto.':blocked),28000);
+ const attempt=()=>{
+  if(done||net.peer!==p)return;
   const c=p.connect(PFX+code,{reliable:true});net.conn=c;
-  c.on('open',()=>{ok=true;clearTimeout(to);c.send(Object.assign({t:'hello'},myInfo()));});
+  c.on('open',()=>{if(done&&!ok)return;ok=true;done=true;busy=false;clearTimeout(to);toast('Connesso! ✔');c.send(Object.assign({t:'hello'},myInfo()));});
   c.on('data',clientMsg);
-  c.on('close',()=>{if(net.role==='client'){toast('Il capocantiere ha chiuso la stanza');goMenu();}});
- });
- p.on('error',e=>{clearTimeout(to);if(e&&e.type==='peer-unavailable')toast('Stanza '+code+' non trovata');else toast('Errore di rete: '+(e&&e.type||e));leaveNet();});
+  c.on('error',()=>{if(!ok&&Date.now()-lastMissing>3000)fail(blocked);});
+  c.on('close',()=>{if(ok&&net.role==='client'&&net.conn===c){toast('Il capocantiere ha chiuso la stanza',5000);goMenu();}});
+ };
+ keepAlive(p);
+ p.on('open',id=>{if(ok)return;myId=id;toast('Cerco la stanza '+code+'…',30000);attempt();});
+ p.on('error',e=>{const t=e&&e.type;if(ok)return;
+  if(t==='peer-unavailable'){lastMissing=Date.now();
+   if(Date.now()-t0<22000){toast('Stanza '+code+' non raggiungibile, riprovo… (il capocantiere deve avere il gioco aperto)',30000);setTimeout(attempt,2500);}
+   else fail('Stanza '+code+' non trovata. Controlla il codice e che il capocantiere tenga il gioco aperto.');return;}
+  fail('Non riesco a raggiungere il server delle stanze. Controlla la connessione e riprova.');});
 }
 function clientMsg(d){
  if(!d||!d.t)return;
@@ -691,7 +738,7 @@ function showResults(res){
  show('results');
 }
 function goMenu(){
- leaveNet();phase='menu';G=null;V=null;
+ busy=false;leaveNet();phase='menu';G=null;V=null;
  ['hud','quit','touch','hint'].forEach(i=>$(i).classList.add('hidden'));
  history.replaceState(null,'',location.pathname+(LOCAL?'#local':''));
  refreshCoins();show('menu');
